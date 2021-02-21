@@ -1,4 +1,4 @@
-package weiss 
+package weiss
 
 import (
 	"encoding/json"
