@@ -75,6 +75,6 @@
 
 FOUNDATION_EXPORT void WeissClose(void);
 
-FOUNDATION_EXPORT void WeissStart(NSString* _Nullable port);
+FOUNDATION_EXPORT void WeissStart(NSString* _Nullable port, NSString* _Nullable jsonData);
 
 #endif
