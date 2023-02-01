@@ -47,8 +47,8 @@ func init() {
 }
 
 func (oneZeroReq *OneZeroReq) fetch() (*OneZeroRes, error) {
-	url := fmt.Sprintf("http://api.pixivlite.com:8091/dns-query?ct=application/dns-json&name=%s&type=A&do=false&cd=false", oneZeroReq.name)
-	log.Print(url)
+	url := fmt.Sprintf("http://bravedefault.com:8091/dns-query?ct=application/dns-json&name=%s&type=A&do=false&cd=false", oneZeroReq.name)
+	log.Println(url)
 	v, ok := hardcodeIpMap[oneZeroReq.name]
 	answer := &OneZeroRes{}
 	if ok {
@@ -62,7 +62,7 @@ func (oneZeroReq *OneZeroReq) fetch() (*OneZeroRes, error) {
 		if err == nil {
 			break
 		} else if i == 2 {
-			body, err = request(strings.ReplaceAll(url, "http://api.pixivlite.com:8091", "https://1.0.0.1"))
+			body, err = request(strings.ReplaceAll(url, "http://bravedefault.com:8091", "https://1.0.0.1"))
 		}
 	}
 	err = json.Unmarshal(body, answer)

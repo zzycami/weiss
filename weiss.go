@@ -114,6 +114,7 @@ func Start(port string, jsonData string) {
 		}
 		defer tlsCon.Close()
 		clientWriter := bufio.NewReadWriter(bufio.NewReader(tlsCon), bufio.NewWriter(tlsCon))
+
 		remoteCon := buildOneZeroCon(ctx, hardMap)
 		if remoteCon == nil {
 			panic("Error host:" + ctx.Req.URL.Hostname())
