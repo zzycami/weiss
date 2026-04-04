@@ -10,7 +10,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -22,6 +21,19 @@ var (
 	}{make(map[string]string), sync.RWMutex{}}
 	server *http.Server
 )
+
+// connectHostMatches accepts CONNECT targets with or without an explicit :443 suffix.
+func connectHostMatches(allowed []string) goproxy.ReqConditionFunc {
+	set := make(map[string]struct{}, len(allowed)*2)
+	for _, name := range allowed {
+		set[name] = struct{}{}
+		set[name+":443"] = struct{}{}
+	}
+	return func(req *http.Request, _ *goproxy.ProxyCtx) bool {
+		_, ok := set[req.URL.Host]
+		return ok
+	}
+}
 
 func Start(port string, jsonData string) {
 	configCache := make(map[string]*tls.Config, 0)
@@ -73,18 +85,14 @@ func Start(port string, jsonData string) {
 	}
 
 	blackList := []string{}
-	whitePorts := make([]string, len(whiteList))
 	blackPorts := make([]string, len(blackList))
-	for i, s := range whiteList {
-		whitePorts[i] = s + ":443"
-	}
 	for i, s := range blackList {
 		blackPorts[i] = s + ":443"
 	}
 
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnRequest(
-		goproxy.ReqHostIs(whitePorts...),
+		connectHostMatches(whiteList),
 	).HijackConnect(func(req *http.Request, conn net.Conn, ctx *goproxy.ProxyCtx) {
 		defer func() {
 			if recover := recover(); recover != nil {
@@ -115,17 +123,23 @@ func Start(port string, jsonData string) {
 		defer tlsCon.Close()
 		clientWriter := bufio.NewReadWriter(bufio.NewReader(tlsCon), bufio.NewWriter(tlsCon))
 
-		remoteCon := buildOneZeroCon(ctx, hardMap)
+		remoteCon, echConfigList := buildOneZeroCon(ctx, hardMap)
 		if remoteCon == nil {
 			panic("Error host:" + ctx.Req.URL.Hostname())
 		}
 		defer remoteCon.Close()
-		remote := tls.Client(remoteCon, &tls.Config{
+		upstreamTLS := &tls.Config{
+			ServerName: ctx.Req.URL.Hostname(),
 			InsecureSkipVerify: true,
 			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 				return nil
 			},
-		})
+		}
+		if len(echConfigList) > 0 {
+			upstreamTLS.MinVersion = tls.VersionTLS13
+			upstreamTLS.EncryptedClientHelloConfigList = echConfigList
+		}
+		remote := tls.Client(remoteCon, upstreamTLS)
 		if err := remote.Handshake(); err != nil {
 			panic(err)
 		}
@@ -177,9 +191,11 @@ func Start(port string, jsonData string) {
 			panic(err)
 		}
 	})
-	proxy.OnRequest(
-		goproxy.ReqHostIs(blackPorts...),
-	).HandleConnect(goproxy.AlwaysReject)
+	if len(blackPorts) > 0 {
+		proxy.OnRequest(
+			goproxy.ReqHostIs(blackPorts...),
+		).HandleConnect(goproxy.AlwaysReject)
+	}
 	proxy.Verbose = true
 	server = &http.Server{Addr: ":" + port, Handler: proxy}
 	go func() {
@@ -194,32 +210,48 @@ func Close() {
 	}
 }
 
-func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) net.Conn {
+// buildOneZeroCon dials the upstream TCP endpoint. When the second return is non-empty,
+// the TLS client must use crypto/tls ECH (TLS 1.3) with that EncryptedClientHelloConfigList.
+// It prefers HK ech/config + ECH (same as iOS); if unavailable, it falls back to OneZero DNS IP dialing.
+func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) (net.Conn, []byte) {
+	host := ctx.Req.URL.Hostname()
+	portSuffix := ":443"
+	if _, p, err := net.SplitHostPort(ctx.Req.Host); err == nil {
+		portSuffix = ":" + p
+	}
+
+	if echList, dialAddr, ok := tryECHUpstream(host, portSuffix); ok {
+		if remoteCon, err := net.Dial("tcp", dialAddr); err == nil {
+			log.Println("weiss upstream ECH", host, "tcp", dialAddr)
+			return remoteCon, echList
+		}
+	}
+
 	OneZeroCache.Lock.RLock()
-	data, ok := OneZeroCache.Data[ctx.Req.URL.Hostname()]
+	data, ok := OneZeroCache.Data[host]
 	OneZeroCache.Lock.RUnlock()
 	if ok {
-		remoteCon, err := net.Dial("tcp", data+ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
+		remoteCon, err := net.Dial("tcp", data+portSuffix)
 		if err != nil {
-			return nil
+			return nil, nil
 		}
-		return remoteCon
+		log.Println("weiss upstream OneZero cache", host)
+		return remoteCon, nil
 	}
 
-	if v, ok := hardMap[ctx.Req.URL.Hostname()]; ok {
-		remoteCon, err := net.Dial("tcp", v+ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
+	if v, ok := hardMap[host]; ok {
+		remoteCon, err := net.Dial("tcp", v+portSuffix)
 		OneZeroCache.Lock.Lock()
-		OneZeroCache.Data[ctx.Req.URL.Hostname()] = v
+		OneZeroCache.Data[host] = v
 		OneZeroCache.Lock.Unlock()
 		if err != nil {
-			return nil
+			return nil, nil
 		}
-		return remoteCon
+		log.Println("weiss upstream hardMap", host)
+		return remoteCon, nil
 	}
 
-	oneZeroReq := OneZeroReq{
-		ctx.Req.URL.Hostname(),
-	}
+	oneZeroReq := OneZeroReq{host}
 	res, err := oneZeroReq.fetch()
 	if err != nil {
 		panic(err)
@@ -228,13 +260,14 @@ func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) net.Conn 
 		if answer.Type != 1 {
 			continue
 		}
-		remoteCon, err := net.Dial("tcp", answer.Data+ctx.Req.Host[strings.LastIndex(ctx.Req.Host, ":"):])
+		remoteCon, err := net.Dial("tcp", answer.Data+portSuffix)
 		if err != nil {
 		}
 		OneZeroCache.Lock.Lock()
-		OneZeroCache.Data[ctx.Req.URL.Hostname()] = answer.Data
+		OneZeroCache.Data[host] = answer.Data
 		OneZeroCache.Lock.Unlock()
-		return remoteCon
+		log.Println("weiss upstream OneZero DNS", host)
+		return remoteCon, nil
 	}
-	return nil
+	return nil, nil
 }
