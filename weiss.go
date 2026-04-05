@@ -5,8 +5,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"github.com/elazarl/goproxy"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -36,8 +37,11 @@ func connectHostMatches(allowed []string) goproxy.ReqConditionFunc {
 }
 
 func Start(port string, jsonData string) {
+	log.Printf("[weiss] Start port=%s jsonBytes=%d", port, len(jsonData))
 	configCache := make(map[string]*tls.Config, 0)
-	DELAY := 8 * time.Second
+	// Handshake must finish quickly; tunnel reads need long idle (login/reCAPTCHA can go quiet >8s).
+	handshakeDeadline := 45 * time.Second
+	tunnelReadDeadline := 10 * time.Minute
 	whiteList := []string{
 		"pixiv.net",
 		"www.pixiv.net",
@@ -72,16 +76,21 @@ func Start(port string, jsonData string) {
 	if len(jsonData) != 0 { //不支持map所以只能传json
 		var f interface{}
 		err := json.Unmarshal([]byte(jsonData), &f)
-		if err == nil {
+		if err != nil {
+			log.Printf("[weiss] JSON parse warn: %v (continuing with empty hardMap)", err)
+		} else {
 			m := f.(map[string]interface{})
 			for k, v := range m {
 				hardMap[k] = v.(string)
 			}
+			log.Printf("[weiss] hardMap entries=%d", len(hardMap))
 		}
+	} else {
+		log.Printf("[weiss] no JSON hardMap (ECH/OneZero only)")
 	}
 	for k, v := range hardMap {
 		OneZeroCache.Data[k] = v
-		fmt.Println(k + v)
+		log.Printf("[weiss] seed cache %s -> %s", k, v)
 	}
 
 	blackList := []string{}
@@ -96,11 +105,13 @@ func Start(port string, jsonData string) {
 	).HijackConnect(func(req *http.Request, conn net.Conn, ctx *goproxy.ProxyCtx) {
 		defer func() {
 			if recover := recover(); recover != nil {
+				log.Printf("[weiss] CONNECT panic host=%s recover=%v", ctx.Req.URL.Host, recover)
 				_, _ = conn.Write([]byte("HTTP/1.1 500"))
 			}
 			conn.Close()
 		}()
-		log.Println(ctx.Req.URL.Hostname())
+		host := ctx.Req.URL.Hostname()
+		log.Printf("[weiss] CONNECT begin host=%s full=%s", host, ctx.Req.URL.Host)
 		clientTLSConfig, err := func(host string) (*tls.Config, error) {
 			if config, ok := configCache[host]; ok {
 				return config, nil
@@ -116,15 +127,19 @@ func Start(port string, jsonData string) {
 			panic(err)
 		}
 		tlsCon := tls.Server(conn, clientTLSConfig)
-		_ = tlsCon.SetDeadline(time.Now().Add(DELAY))
+		_ = tlsCon.SetDeadline(time.Now().Add(handshakeDeadline))
+		log.Printf("[weiss] MITM TLS handshake (client side) host=%s", host)
 		if err := tlsCon.Handshake(); err != nil {
+			log.Printf("[weiss] MITM TLS handshake failed host=%s err=%v", host, err)
 			panic(err)
 		}
+		_ = tlsCon.SetDeadline(time.Time{})
 		defer tlsCon.Close()
 		clientWriter := bufio.NewReadWriter(bufio.NewReader(tlsCon), bufio.NewWriter(tlsCon))
 
 		remoteCon, echConfigList := buildOneZeroCon(ctx, hardMap)
 		if remoteCon == nil {
+			log.Printf("[weiss] buildOneZeroCon returned nil host=%s", host)
 			panic("Error host:" + ctx.Req.URL.Hostname())
 		}
 		defer remoteCon.Close()
@@ -140,56 +155,84 @@ func Start(port string, jsonData string) {
 			upstreamTLS.EncryptedClientHelloConfigList = echConfigList
 		}
 		remote := tls.Client(remoteCon, upstreamTLS)
+		_ = remote.SetDeadline(time.Now().Add(handshakeDeadline))
+		log.Printf("[weiss] upstream TLS handshake host=%s ech=%t", host, len(echConfigList) > 0)
 		if err := remote.Handshake(); err != nil {
+			log.Printf("[weiss] upstream TLS handshake failed host=%s err=%v", host, err)
 			panic(err)
 		}
+		_ = remote.SetDeadline(time.Time{})
 		defer remote.Close()
 		remoteWriter := bufio.NewReadWriter(bufio.NewReader(remote), bufio.NewWriter(remote))
-		channel := make(chan error)
+		log.Printf("[weiss] tunnel ready host=%s (read idle deadline=%v per direction; was 8s and broke quiet pages)", host, tunnelReadDeadline)
+		channel := make(chan error, 2)
 		go func() {
-			buffer := make([]byte, 1024)
+			buffer := make([]byte, 32768)
 			var err error
+			var n int
 			for {
-				_ = tlsCon.SetDeadline(time.Now().Add(DELAY))
-				num, err := clientWriter.Read(buffer)
+				_ = tlsCon.SetDeadline(time.Now().Add(tunnelReadDeadline))
+				n, err = clientWriter.Read(buffer)
 				if err != nil {
+					log.Printf("[weiss] tunnel client->upstream STOP host=%s readErr=%v bytes=%d", host, err, n)
 					break
 				}
-				_, err = remoteWriter.Write(buffer[:num])
+				if n == 0 {
+					continue
+				}
+				_, err = remoteWriter.Write(buffer[:n])
 				if err != nil {
+					log.Printf("[weiss] tunnel client->upstream STOP host=%s writeErr=%v", host, err)
 					break
 				}
 				if err := remoteWriter.Flush(); err != nil {
+					log.Printf("[weiss] tunnel client->upstream STOP host=%s flushErr=%v", host, err)
 					break
 				}
 			}
 			channel <- err
 		}()
 		go func() {
-			buffer := make([]byte, 1024)
+			buffer := make([]byte, 32768)
 			var err error
+			var n int
 			for {
-				_ = tlsCon.SetDeadline(time.Now().Add(DELAY))
-				num, err := remoteWriter.Read(buffer)
+				_ = remote.SetDeadline(time.Now().Add(tunnelReadDeadline))
+				n, err = remoteWriter.Read(buffer)
 				if err != nil {
+					log.Printf("[weiss] tunnel upstream->client STOP host=%s readErr=%v bytes=%d", host, err, n)
 					break
 				}
-				_, err = clientWriter.Write(buffer[:num])
+				if n == 0 {
+					continue
+				}
+				_, err = clientWriter.Write(buffer[:n])
 				if err != nil {
+					log.Printf("[weiss] tunnel upstream->client STOP host=%s writeErr=%v", host, err)
 					break
 				}
 				if err := clientWriter.Flush(); err != nil {
+					log.Printf("[weiss] tunnel upstream->client STOP host=%s flushErr=%v", host, err)
 					break
 				}
 			}
 			channel <- err
 		}()
-		if err := <-channel; err != nil {
-			panic(err)
+		e1 := <-channel
+		e2 := <-channel
+		if e1 != nil {
+			log.Printf("[weiss] tunnel first leg done host=%s err=%v", host, e1)
 		}
-		if err := <-channel; err != nil {
-			panic(err)
+		if e2 != nil {
+			log.Printf("[weiss] tunnel second leg done host=%s err=%v", host, e2)
 		}
+		if e1 != nil && !errors.Is(e1, io.EOF) {
+			panic(e1)
+		}
+		if e2 != nil && !errors.Is(e2, io.EOF) {
+			panic(e2)
+		}
+		log.Printf("[weiss] CONNECT end host=%s (tunnel closed)", host)
 	})
 	if len(blackPorts) > 0 {
 		proxy.OnRequest(
@@ -199,7 +242,9 @@ func Start(port string, jsonData string) {
 	proxy.Verbose = true
 	server = &http.Server{Addr: ":" + port, Handler: proxy}
 	go func() {
-		if err := server.ListenAndServe(); err != nil {
+		log.Printf("[weiss] ListenAndServe :%s", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[weiss] ListenAndServe stopped: %v", err)
 		}
 	}()
 }
@@ -221,10 +266,15 @@ func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) (net.Conn
 	}
 
 	if echList, dialAddr, ok := tryECHUpstream(host, portSuffix); ok {
-		if remoteCon, err := net.Dial("tcp", dialAddr); err == nil {
-			log.Println("weiss upstream ECH", host, "tcp", dialAddr)
+		remoteCon, err := net.Dial("tcp", dialAddr)
+		if err != nil {
+			log.Printf("[weiss] buildOneZeroCon ECH dial failed host=%s addr=%s err=%v", host, dialAddr, err)
+		} else {
+			log.Printf("[weiss] buildOneZeroCon path=ECH host=%s dial=%s echBytes=%d", host, dialAddr, len(echList))
 			return remoteCon, echList
 		}
+	} else {
+		log.Printf("[weiss] buildOneZeroCon ECH unavailable host=%s (fallback)", host)
 	}
 
 	OneZeroCache.Lock.RLock()
@@ -233,9 +283,10 @@ func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) (net.Conn
 	if ok {
 		remoteCon, err := net.Dial("tcp", data+portSuffix)
 		if err != nil {
+			log.Printf("[weiss] buildOneZeroCon OneZero cache dial fail host=%s addr=%s err=%v", host, data+portSuffix, err)
 			return nil, nil
 		}
-		log.Println("weiss upstream OneZero cache", host)
+		log.Printf("[weiss] buildOneZeroCon path=OneZeroCache host=%s addr=%s", host, data+portSuffix)
 		return remoteCon, nil
 	}
 
@@ -245,15 +296,18 @@ func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) (net.Conn
 		OneZeroCache.Data[host] = v
 		OneZeroCache.Lock.Unlock()
 		if err != nil {
+			log.Printf("[weiss] buildOneZeroCon hardMap dial fail host=%s addr=%s err=%v", host, v+portSuffix, err)
 			return nil, nil
 		}
-		log.Println("weiss upstream hardMap", host)
+		log.Printf("[weiss] buildOneZeroCon path=hardMap host=%s addr=%s", host, v+portSuffix)
 		return remoteCon, nil
 	}
 
+	log.Printf("[weiss] buildOneZeroCon path=OneZero DNS fetch host=%s", host)
 	oneZeroReq := OneZeroReq{host}
 	res, err := oneZeroReq.fetch()
 	if err != nil {
+		log.Printf("[weiss] OneZero fetch panic host=%s err=%v", host, err)
 		panic(err)
 	}
 	for _, answer := range res.Answer {
@@ -262,12 +316,15 @@ func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) (net.Conn
 		}
 		remoteCon, err := net.Dial("tcp", answer.Data+portSuffix)
 		if err != nil {
+			log.Printf("[weiss] buildOneZeroCon OneZero DNS dial fail host=%s addr=%s err=%v", host, answer.Data+portSuffix, err)
+			return nil, nil
 		}
 		OneZeroCache.Lock.Lock()
 		OneZeroCache.Data[host] = answer.Data
 		OneZeroCache.Lock.Unlock()
-		log.Println("weiss upstream OneZero DNS", host)
+		log.Printf("[weiss] buildOneZeroCon path=OneZeroDNS host=%s addr=%s", host, answer.Data+portSuffix)
 		return remoteCon, nil
 	}
+	log.Printf("[weiss] buildOneZeroCon no route host=%s", host)
 	return nil, nil
 }

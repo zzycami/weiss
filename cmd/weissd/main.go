@@ -1,9 +1,16 @@
-// Command weissd runs the local MITM CONNECT proxy for manual testing (curl, browsers, etc.).
+// Command weissd runs the local MITM CONNECT proxy for manual testing (curl, browsers, iOS Simulator, etc.).
+//
+// Simulator shares the Mac loopback: if weissd listens on 127.0.0.1:PORT, the app uses the same PORT
+// via HttpProxySessionManager (and must skip in-app WeissStart — see pixiv-client WebViewController, env PIXIV_USE_EXTERNAL_WEISS=1).
 //
 // Example:
 //
-//	go run ./cmd/weissd 8091
-//	curl -vk --http1.1 -x http://127.0.0.1:8091 'https://app-api.pixiv.net/'
+//	go run ./cmd/weissd 28492
+//	curl -vk --http1.1 -x http://127.0.0.1:28492 'https://app-api.pixiv.net/'
+//
+// Optional third argument: same JSON host→IP map as iOS prints from ConfigManager (paste single line in quotes).
+//
+//	go run ./cmd/weissd 28492 '{"app-api.pixiv.net":"210.140.139.155",...}'
 package main
 
 import (

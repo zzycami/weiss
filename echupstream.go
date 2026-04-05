@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -86,20 +87,28 @@ func fetchEchFromAPI(hostname string) ([]byte, []string, int64, error) {
 	q.Set("host", hostname)
 	u.RawQuery = q.Encode()
 
+	log.Printf("[weiss-ech] GET %s", u.String())
 	resp, err := echHTTPClient.Get(u.String())
 	if err != nil {
+		log.Printf("[weiss-ech] GET err host=%s %v", hostname, err)
 		return nil, nil, 0, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[weiss-ech] HTTP status=%d host=%s", resp.StatusCode, hostname)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		log.Printf("[weiss-ech] read body err host=%s %v", hostname, err)
 		return nil, nil, 0, err
 	}
 	var parsed echAPIResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
+		log.Printf("[weiss-ech] JSON unmarshal err host=%s bodyPrefix=%q err=%v", hostname, trimForLog(body, 120), err)
 		return nil, nil, 0, err
 	}
 	if parsed.EchConfig == nil || *parsed.EchConfig == "" {
+		log.Printf("[weiss-ech] empty echConfig host=%s source=%s", hostname, parsed.Source)
 		return nil, nil, parsed.TTL, fmt.Errorf("ech: empty echConfig")
 	}
 	raw, err := base64.StdEncoding.DecodeString(*parsed.EchConfig)
@@ -116,7 +125,16 @@ func fetchEchFromAPI(hostname string) ([]byte, []string, int64, error) {
 			hints = append(hints, t)
 		}
 	}
+	log.Printf("[weiss-ech] ok host=%s hints=%v ttl=%d rawLen=%d", hostname, hints, parsed.TTL, len(raw))
 	return raw, hints, parsed.TTL, nil
+}
+
+func trimForLog(b []byte, max int) string {
+	s := string(b)
+	if len(s) > max {
+		return s[:max] + "…"
+	}
+	return s
 }
 
 // tryECHUpstream returns TLS ECH config list bytes and a TCP dial address (host:port).
@@ -129,18 +147,26 @@ func tryECHUpstream(hostname, portSuffix string) (echList []byte, dialAddr strin
 	if e, hit := getEchCached(h); hit {
 		addr := resolveDialAddr(h, e.ips, portSuffix)
 		if addr == "" {
+			log.Printf("[weiss-ech] cache hit but resolveDialAddr empty host=%s hints=%v", h, e.ips)
 			return nil, "", false
 		}
+		log.Printf("[weiss-ech] cache HIT host=%s dial=%s echLen=%d", h, addr, len(e.list))
 		return e.list, addr, true
 	}
 
 	list, hints, apiTTL, err := fetchEchFromAPI(h)
 	if err != nil || len(list) == 0 {
+		if err != nil {
+			log.Printf("[weiss-ech] fetch miss host=%s err=%v", h, err)
+		} else {
+			log.Printf("[weiss-ech] fetch miss host=%s empty list", h)
+		}
 		return nil, "", false
 	}
 
 	addr := resolveDialAddr(h, hints, portSuffix)
 	if addr == "" {
+		log.Printf("[weiss-ech] resolveDialAddr empty after fetch host=%s hints=%v", h, hints)
 		return nil, "", false
 	}
 
