@@ -137,9 +137,9 @@ func Start(port string, jsonData string) {
 		defer tlsCon.Close()
 		clientWriter := bufio.NewReadWriter(bufio.NewReader(tlsCon), bufio.NewWriter(tlsCon))
 
-		remoteCon, echConfigList := buildOneZeroCon(ctx, hardMap)
+		remoteCon, echConfigList := buildUpstreamDial(ctx, hardMap, true)
 		if remoteCon == nil {
-			log.Printf("[weiss] buildOneZeroCon returned nil host=%s", host)
+			log.Printf("[weiss] buildUpstreamDial returned nil host=%s", host)
 			panic("Error host:" + ctx.Req.URL.Hostname())
 		}
 		defer remoteCon.Close()
@@ -158,8 +158,33 @@ func Start(port string, jsonData string) {
 		_ = remote.SetDeadline(time.Now().Add(handshakeDeadline))
 		log.Printf("[weiss] upstream TLS handshake host=%s ech=%t", host, len(echConfigList) > 0)
 		if err := remote.Handshake(); err != nil {
-			log.Printf("[weiss] upstream TLS handshake failed host=%s err=%v", host, err)
-			panic(err)
+			if len(echConfigList) > 0 {
+				log.Printf("[weiss] upstream ECH handshake failed, retry plain domain fronting host=%s err=%v", host, err)
+				_ = remote.Close()
+				remoteCon2, _ := buildUpstreamDial(ctx, hardMap, false)
+				if remoteCon2 == nil {
+					log.Printf("[weiss] plain dial after ECH failure unavailable host=%s", host)
+					panic(err)
+				}
+				defer remoteCon2.Close()
+				upstreamPlain := &tls.Config{
+					ServerName: ctx.Req.URL.Hostname(),
+					InsecureSkipVerify: true,
+					VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+						return nil
+					},
+				}
+				remote = tls.Client(remoteCon2, upstreamPlain)
+				_ = remote.SetDeadline(time.Now().Add(handshakeDeadline))
+				log.Printf("[weiss] upstream TLS handshake (plain) host=%s", host)
+				if err2 := remote.Handshake(); err2 != nil {
+					log.Printf("[weiss] upstream plain TLS handshake failed host=%s err=%v", host, err2)
+					panic(err2)
+				}
+			} else {
+				log.Printf("[weiss] upstream TLS handshake failed host=%s err=%v", host, err)
+				panic(err)
+			}
 		}
 		_ = remote.SetDeadline(time.Time{})
 		defer remote.Close()
@@ -255,26 +280,29 @@ func Close() {
 	}
 }
 
-// buildOneZeroCon dials the upstream TCP endpoint. When the second return is non-empty,
+// buildUpstreamDial dials the upstream TCP endpoint. When the second return is non-empty,
 // the TLS client must use crypto/tls ECH (TLS 1.3) with that EncryptedClientHelloConfigList.
-// It prefers HK ech/config + ECH (same as iOS); if unavailable, it falls back to OneZero DNS IP dialing.
-func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) (net.Conn, []byte) {
+// If allowEch is true: prefers HK ech/config + ECH (same as iOS); on failure falls through to OneZero.
+// If allowEch is false: skips ECH (domain fronting: dial resolved IP, TLS ServerName still the hostname).
+func buildUpstreamDial(ctx *goproxy.ProxyCtx, hardMap map[string]string, allowEch bool) (net.Conn, []byte) {
 	host := ctx.Req.URL.Hostname()
 	portSuffix := ":443"
 	if _, p, err := net.SplitHostPort(ctx.Req.Host); err == nil {
 		portSuffix = ":" + p
 	}
 
-	if echList, dialAddr, ok := tryECHUpstream(host, portSuffix); ok {
-		remoteCon, err := net.Dial("tcp", dialAddr)
-		if err != nil {
-			log.Printf("[weiss] buildOneZeroCon ECH dial failed host=%s addr=%s err=%v", host, dialAddr, err)
+	if allowEch {
+		if echList, dialAddr, ok := tryECHUpstream(host, portSuffix); ok {
+			remoteCon, err := net.Dial("tcp", dialAddr)
+			if err != nil {
+				log.Printf("[weiss] buildUpstreamDial ECH dial failed host=%s addr=%s err=%v", host, dialAddr, err)
+			} else {
+				log.Printf("[weiss] buildUpstreamDial path=ECH host=%s dial=%s echBytes=%d", host, dialAddr, len(echList))
+				return remoteCon, echList
+			}
 		} else {
-			log.Printf("[weiss] buildOneZeroCon path=ECH host=%s dial=%s echBytes=%d", host, dialAddr, len(echList))
-			return remoteCon, echList
+			log.Printf("[weiss] buildUpstreamDial ECH unavailable host=%s (fallback)", host)
 		}
-	} else {
-		log.Printf("[weiss] buildOneZeroCon ECH unavailable host=%s (fallback)", host)
 	}
 
 	OneZeroCache.Lock.RLock()
@@ -283,10 +311,10 @@ func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) (net.Conn
 	if ok {
 		remoteCon, err := net.Dial("tcp", data+portSuffix)
 		if err != nil {
-			log.Printf("[weiss] buildOneZeroCon OneZero cache dial fail host=%s addr=%s err=%v", host, data+portSuffix, err)
+			log.Printf("[weiss] buildUpstreamDial OneZero cache dial fail host=%s addr=%s err=%v", host, data+portSuffix, err)
 			return nil, nil
 		}
-		log.Printf("[weiss] buildOneZeroCon path=OneZeroCache host=%s addr=%s", host, data+portSuffix)
+		log.Printf("[weiss] buildUpstreamDial path=OneZeroCache host=%s addr=%s", host, data+portSuffix)
 		return remoteCon, nil
 	}
 
@@ -296,14 +324,14 @@ func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) (net.Conn
 		OneZeroCache.Data[host] = v
 		OneZeroCache.Lock.Unlock()
 		if err != nil {
-			log.Printf("[weiss] buildOneZeroCon hardMap dial fail host=%s addr=%s err=%v", host, v+portSuffix, err)
+			log.Printf("[weiss] buildUpstreamDial hardMap dial fail host=%s addr=%s err=%v", host, v+portSuffix, err)
 			return nil, nil
 		}
-		log.Printf("[weiss] buildOneZeroCon path=hardMap host=%s addr=%s", host, v+portSuffix)
+		log.Printf("[weiss] buildUpstreamDial path=hardMap host=%s addr=%s", host, v+portSuffix)
 		return remoteCon, nil
 	}
 
-	log.Printf("[weiss] buildOneZeroCon path=OneZero DNS fetch host=%s", host)
+	log.Printf("[weiss] buildUpstreamDial path=OneZero DNS fetch host=%s", host)
 	oneZeroReq := OneZeroReq{host}
 	res, err := oneZeroReq.fetch()
 	if err != nil {
@@ -316,15 +344,15 @@ func buildOneZeroCon(ctx *goproxy.ProxyCtx, hardMap map[string]string) (net.Conn
 		}
 		remoteCon, err := net.Dial("tcp", answer.Data+portSuffix)
 		if err != nil {
-			log.Printf("[weiss] buildOneZeroCon OneZero DNS dial fail host=%s addr=%s err=%v", host, answer.Data+portSuffix, err)
+			log.Printf("[weiss] buildUpstreamDial OneZero DNS dial fail host=%s addr=%s err=%v", host, answer.Data+portSuffix, err)
 			return nil, nil
 		}
 		OneZeroCache.Lock.Lock()
 		OneZeroCache.Data[host] = answer.Data
 		OneZeroCache.Lock.Unlock()
-		log.Printf("[weiss] buildOneZeroCon path=OneZeroDNS host=%s addr=%s", host, answer.Data+portSuffix)
+		log.Printf("[weiss] buildUpstreamDial path=OneZeroDNS host=%s addr=%s", host, answer.Data+portSuffix)
 		return remoteCon, nil
 	}
-	log.Printf("[weiss] buildOneZeroCon no route host=%s", host)
+	log.Printf("[weiss] buildUpstreamDial no route host=%s", host)
 	return nil, nil
 }
