@@ -17,6 +17,18 @@ bash openssl-gen.sh
 weiss.Start("7890")
 weiss.Stop()
 ``` 
+# JSON 参数（`Start(port, json)` / weissd 第三参数）
+
+除 host→IP 映射外，可设置 **`upstream_mode`**（与 iOS 设置「登录代理（Weiss）传输」一致）：
+
+| 值 | 行为 |
+|----|------|
+| `auto`（默认） | 先走 HK `ech/config` 的 ECH；ECH TLS 握手失败再回退域名前置（硬编码/OneZero/DNS） |
+| `ech_only` | 仅 ECH，不回退域名前置 |
+| `fronting_only` | 不使用 ECH，仅域名前置 |
+
+示例：`{"accounts.pixiv.net":"210.140.x.x","upstream_mode":"fronting_only"}`
+
 # 缺陷  
 `Doh`方式获取真实ip仍然存在cloudflare套壳的问题，需要及时硬编码更新  
 可以修改`onezero.go`的`hardcodeIpMap`达成硬编码的目的  

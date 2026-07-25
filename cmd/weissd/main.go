@@ -8,9 +8,12 @@
 //	go run ./cmd/weissd 28492
 //	curl -vk --http1.1 -x http://127.0.0.1:28492 'https://app-api.pixiv.net/'
 //
-// Optional third argument: same JSON host→IP map as iOS prints from ConfigManager (paste single line in quotes).
+// Optional third argument: same JSON as iOS `createWeissJsonValue()`: host→IP map plus optional `upstream_mode`:
+//   "auto" (default) — try HK ech/config ECH, then domain fronting on ECH TLS failure;
+//   "ech_only" — ECH only (no plain fallback);
+//   "fronting_only" — skip ECH, use JSON / OneZero / DNS only.
 //
-//	go run ./cmd/weissd 28492 '{"app-api.pixiv.net":"210.140.139.155",...}'
+//	go run ./cmd/weissd 28492 '{"app-api.pixiv.net":"210.140.139.155","upstream_mode":"fronting_only"}'
 package main
 
 import (

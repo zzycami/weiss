@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,7 +22,52 @@ var (
 		Lock sync.RWMutex
 	}{make(map[string]string), sync.RWMutex{}}
 	server *http.Server
+
+	// upstreamTransportMode is set from JSON key `upstream_mode` in Start (default: auto).
+	upstreamTransportMode = upstreamModeAuto
 )
+
+// UpstreamTransportMode selects ECH vs domain fronting for CONNECT upstream TLS.
+type UpstreamTransportMode int
+
+const (
+	upstreamModeAuto UpstreamTransportMode = iota
+	upstreamModeECHOnly
+	upstreamModeFrontingOnly
+)
+
+func upstreamModeString(m UpstreamTransportMode) string {
+	switch m {
+	case upstreamModeECHOnly:
+		return "ech_only"
+	case upstreamModeFrontingOnly:
+		return "fronting_only"
+	default:
+		return "auto"
+	}
+}
+
+func parseUpstreamModeFromJSON(jsonData string) UpstreamTransportMode {
+	if len(jsonData) == 0 {
+		return upstreamModeAuto
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonData), &m); err != nil {
+		return upstreamModeAuto
+	}
+	raw, ok := m["upstream_mode"].(string)
+	if !ok {
+		return upstreamModeAuto
+	}
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "ech_only", "echonly":
+		return upstreamModeECHOnly
+	case "fronting_only", "frontingonly", "domain_fronting", "fronting":
+		return upstreamModeFrontingOnly
+	default:
+		return upstreamModeAuto
+	}
+}
 
 // connectHostMatches accepts CONNECT targets with or without an explicit :443 suffix.
 func connectHostMatches(allowed []string) goproxy.ReqConditionFunc {
@@ -37,7 +83,8 @@ func connectHostMatches(allowed []string) goproxy.ReqConditionFunc {
 }
 
 func Start(port string, jsonData string) {
-	log.Printf("[weiss] Start port=%s jsonBytes=%d", port, len(jsonData))
+	upstreamTransportMode = parseUpstreamModeFromJSON(jsonData)
+	log.Printf("[weiss] Start port=%s jsonBytes=%d upstream_mode=%s", port, len(jsonData), upstreamModeString(upstreamTransportMode))
 	configCache := make(map[string]*tls.Config, 0)
 	// Handshake must finish quickly; tunnel reads need long idle (login/reCAPTCHA can go quiet >8s).
 	handshakeDeadline := 45 * time.Second
@@ -81,7 +128,15 @@ func Start(port string, jsonData string) {
 		} else {
 			m := f.(map[string]interface{})
 			for k, v := range m {
-				hardMap[k] = v.(string)
+				if k == "upstream_mode" {
+					continue
+				}
+				s, ok := v.(string)
+				if !ok {
+					log.Printf("[weiss] JSON skip non-string key=%q", k)
+					continue
+				}
+				hardMap[k] = s
 			}
 			log.Printf("[weiss] hardMap entries=%d", len(hardMap))
 		}
@@ -137,7 +192,7 @@ func Start(port string, jsonData string) {
 		defer tlsCon.Close()
 		clientWriter := bufio.NewReadWriter(bufio.NewReader(tlsCon), bufio.NewWriter(tlsCon))
 
-		remoteCon, echConfigList := buildUpstreamDial(ctx, hardMap, true)
+		remoteCon, echConfigList := buildUpstreamDial(ctx, hardMap, upstreamTransportMode)
 		if remoteCon == nil {
 			log.Printf("[weiss] buildUpstreamDial returned nil host=%s", host)
 			panic("Error host:" + ctx.Req.URL.Hostname())
@@ -159,27 +214,32 @@ func Start(port string, jsonData string) {
 		log.Printf("[weiss] upstream TLS handshake host=%s ech=%t", host, len(echConfigList) > 0)
 		if err := remote.Handshake(); err != nil {
 			if len(echConfigList) > 0 {
-				log.Printf("[weiss] upstream ECH handshake failed, retry plain domain fronting host=%s err=%v", host, err)
-				_ = remote.Close()
-				remoteCon2, _ := buildUpstreamDial(ctx, hardMap, false)
-				if remoteCon2 == nil {
-					log.Printf("[weiss] plain dial after ECH failure unavailable host=%s", host)
+				if upstreamTransportMode == upstreamModeAuto {
+					log.Printf("[weiss] upstream ECH handshake failed, retry plain domain fronting host=%s err=%v", host, err)
+					_ = remote.Close()
+					remoteCon2, _ := buildUpstreamDial(ctx, hardMap, upstreamModeFrontingOnly)
+					if remoteCon2 == nil {
+						log.Printf("[weiss] plain dial after ECH failure unavailable host=%s", host)
+						panic(err)
+					}
+					defer remoteCon2.Close()
+					upstreamPlain := &tls.Config{
+						ServerName: ctx.Req.URL.Hostname(),
+						InsecureSkipVerify: true,
+						VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+							return nil
+						},
+					}
+					remote = tls.Client(remoteCon2, upstreamPlain)
+					_ = remote.SetDeadline(time.Now().Add(handshakeDeadline))
+					log.Printf("[weiss] upstream TLS handshake (plain) host=%s", host)
+					if err2 := remote.Handshake(); err2 != nil {
+						log.Printf("[weiss] upstream plain TLS handshake failed host=%s err=%v", host, err2)
+						panic(err2)
+					}
+				} else {
+					log.Printf("[weiss] upstream ECH handshake failed host=%s mode=%s err=%v", host, upstreamModeString(upstreamTransportMode), err)
 					panic(err)
-				}
-				defer remoteCon2.Close()
-				upstreamPlain := &tls.Config{
-					ServerName: ctx.Req.URL.Hostname(),
-					InsecureSkipVerify: true,
-					VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-						return nil
-					},
-				}
-				remote = tls.Client(remoteCon2, upstreamPlain)
-				_ = remote.SetDeadline(time.Now().Add(handshakeDeadline))
-				log.Printf("[weiss] upstream TLS handshake (plain) host=%s", host)
-				if err2 := remote.Handshake(); err2 != nil {
-					log.Printf("[weiss] upstream plain TLS handshake failed host=%s err=%v", host, err2)
-					panic(err2)
 				}
 			} else {
 				log.Printf("[weiss] upstream TLS handshake failed host=%s err=%v", host, err)
@@ -265,11 +325,23 @@ func Start(port string, jsonData string) {
 		).HandleConnect(goproxy.AlwaysReject)
 	}
 	proxy.Verbose = true
-	server = &http.Server{Addr: ":" + port, Handler: proxy}
+	// Bind loopback first so sandboxed Mac Catalyst (needs network.server) and in-app
+	// STURLSession both hit 127.0.0.1. Fall back to all-interfaces for weissd / LAN use.
+	listenAddrs := []string{"127.0.0.1:" + port, ":" + port}
 	go func() {
-		log.Printf("[weiss] ListenAndServe :%s", port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("[weiss] ListenAndServe stopped: %v", err)
+		var lastErr error
+		for _, addr := range listenAddrs {
+			server = &http.Server{Addr: addr, Handler: proxy}
+			log.Printf("[weiss] ListenAndServe %s", addr)
+			err := server.ListenAndServe()
+			if err == nil || err == http.ErrServerClosed {
+				return
+			}
+			lastErr = err
+			log.Printf("[weiss] ListenAndServe %s failed: %v", addr, err)
+		}
+		if lastErr != nil {
+			log.Printf("[weiss] ListenAndServe gave up on port %s: %v (Mac Catalyst: enable com.apple.security.network.server)", port, lastErr)
 		}
 	}()
 }
@@ -282,16 +354,30 @@ func Close() {
 
 // buildUpstreamDial dials the upstream TCP endpoint. When the second return is non-empty,
 // the TLS client must use crypto/tls ECH (TLS 1.3) with that EncryptedClientHelloConfigList.
-// If allowEch is true: prefers HK ech/config + ECH (same as iOS); on failure falls through to OneZero.
-// If allowEch is false: skips ECH (domain fronting: dial resolved IP, TLS ServerName still the hostname).
-func buildUpstreamDial(ctx *goproxy.ProxyCtx, hardMap map[string]string, allowEch bool) (net.Conn, []byte) {
+// mode controls whether to try HK ech/config ECH first, domain fronting only, or ECH without plain fallback (see upstream_mode JSON).
+func buildUpstreamDial(ctx *goproxy.ProxyCtx, hardMap map[string]string, mode UpstreamTransportMode) (net.Conn, []byte) {
 	host := ctx.Req.URL.Hostname()
 	portSuffix := ":443"
 	if _, p, err := net.SplitHostPort(ctx.Req.Host); err == nil {
 		portSuffix = ":" + p
 	}
 
-	if allowEch {
+	switch mode {
+	case upstreamModeFrontingOnly:
+		return buildUpstreamDialPlain(ctx, hardMap, host, portSuffix)
+	case upstreamModeECHOnly:
+		if echList, dialAddr, ok := tryECHUpstream(host, portSuffix); ok {
+			remoteCon, err := net.Dial("tcp", dialAddr)
+			if err != nil {
+				log.Printf("[weiss] buildUpstreamDial ECH-only dial failed host=%s addr=%s err=%v", host, dialAddr, err)
+				return nil, nil
+			}
+			log.Printf("[weiss] buildUpstreamDial path=ECH host=%s dial=%s echBytes=%d", host, dialAddr, len(echList))
+			return remoteCon, echList
+		}
+		log.Printf("[weiss] buildUpstreamDial ECH-only miss host=%s", host)
+		return nil, nil
+	default: // upstreamModeAuto
 		if echList, dialAddr, ok := tryECHUpstream(host, portSuffix); ok {
 			remoteCon, err := net.Dial("tcp", dialAddr)
 			if err != nil {
@@ -303,8 +389,12 @@ func buildUpstreamDial(ctx *goproxy.ProxyCtx, hardMap map[string]string, allowEc
 		} else {
 			log.Printf("[weiss] buildUpstreamDial ECH unavailable host=%s (fallback)", host)
 		}
+		return buildUpstreamDialPlain(ctx, hardMap, host, portSuffix)
 	}
+}
 
+// buildUpstreamDialPlain: domain fronting / OneZero / JSON hardMap (no ECH).
+func buildUpstreamDialPlain(ctx *goproxy.ProxyCtx, hardMap map[string]string, host, portSuffix string) (net.Conn, []byte) {
 	OneZeroCache.Lock.RLock()
 	data, ok := OneZeroCache.Data[host]
 	OneZeroCache.Lock.RUnlock()
